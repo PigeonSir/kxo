@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "zobrist.h": "c"
+    },
+    "editor.fontSize": 18,
+    "workbench.colorTheme": "Visual Studio 2017 Dark - C++"
+}
