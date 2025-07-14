@@ -51,6 +51,12 @@ struct kxo_task {
     struct tasklet_struct tasklet;
     struct work_struct ai_one;
     struct work_struct ai_two;
+    struct work_struct draw;
+
+    struct cdev cdev;
+    struct device *dev;
+
+    struct mutex lock;
 };
 
 /* Declare the queue of games */
@@ -221,7 +227,7 @@ static void ai_one_work_func(struct work_struct *w)
     cpu = get_cpu();
     pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
     tv_start = ktime_get();
-    mutex_lock(&producer_lock);
+    mutex_lock(&cur->lock);
     int move;
     WRITE_ONCE(move, mcts(cur->table, 'O'));
     pr_info("kxo: [game %d] AI %c played at %d\n", cur->id, 'O', move);
@@ -233,7 +239,7 @@ static void ai_one_work_func(struct work_struct *w)
     WRITE_ONCE(cur->turn, 'X');
     WRITE_ONCE(cur->finish, 1);
     smp_wmb();
-    mutex_unlock(&producer_lock);
+    mutex_unlock(&cur->lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -256,7 +262,7 @@ static void ai_two_work_func(struct work_struct *w)
     cpu = get_cpu();
     pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
     tv_start = ktime_get();
-    mutex_lock(&producer_lock);
+    mutex_lock(&cur->lock);
     int move;
     WRITE_ONCE(move, negamax_predict(cur->table, 'X').move);
     pr_info("kxo: [game %d] AI %c played at %d\n", cur->id, 'X', move);
@@ -269,7 +275,7 @@ static void ai_two_work_func(struct work_struct *w)
     WRITE_ONCE(cur->turn, 'O');
     WRITE_ONCE(cur->finish, 1);
     smp_wmb();
-    mutex_unlock(&producer_lock);
+    mutex_unlock(&cur->lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -280,13 +286,6 @@ static void ai_two_work_func(struct work_struct *w)
 
 /* Workqueue for asynchronous bottom-half processing */
 static struct workqueue_struct *kxo_workqueue;
-
-/* Work item: holds a pointer to the function that is going to be executed
- * asynchronously.
- */
-static DECLARE_WORK(drawboard_work, drawboard_work_func);
-static DECLARE_WORK(ai_one_work, ai_one_work_func);
-static DECLARE_WORK(ai_two_work, ai_two_work_func);
 
 /* Tasklet handler.
  *
@@ -312,16 +311,13 @@ static void game_tasklet_func(unsigned long __data)
     if (finish && turn == 'O') {
         WRITE_ONCE(cur->finish, 0);
         smp_wmb();
-        // queue_work(kxo_workqueue, &ai_one_work);
-        queue_work(kxo_workqueue, &cur->ai_one.work);
+        queue_work(kxo_workqueue, &cur->ai_one);
     } else if (finish && turn == 'X') {
         WRITE_ONCE(cur->finish, 0);
         smp_wmb();
-        // queue_work(kxo_workqueue, &ai_two_work);
-        queue_work(kxo_workqueue, &cur->ai_two.work);
+        queue_work(kxo_workqueue, &cur->ai_two);
     }
-    // queue_work(kxo_workqueue, &drawboard_work);
-    queue_work(kxo_workqueue, &cur->draw.work);
+    // queue_work(kxo_workqueue, &cur->draw);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -330,9 +326,6 @@ static void game_tasklet_func(unsigned long __data)
             smp_processor_id(), cur->id, __func__,
             (unsigned long long) nsecs >> 10);
 }
-
-/* Tasklet for asynchronous bottom-half processing in softirq context */
-static DECLARE_TASKLET_OLD(game_tasklet, game_tasklet_func);
 
 static void ai_game(struct kxo_task *cur)
 {
@@ -374,14 +367,14 @@ static void timer_handler(struct timer_list *__timer)
                         cur->id);
                 put_cpu();
 
-                mutex_lock(&producer_lock);
-                draw_board(cur->table);
-                mutex_unlock(&producer_lock);
+                // mutex_lock(&producer_lock);
+                // draw_board(cur->table);
+                // mutex_unlock(&producer_lock);
 
                 /* Store data to the kfifo buffer */
-                mutex_lock(&consumer_lock);
-                produce_board();
-                mutex_unlock(&consumer_lock);
+                // mutex_lock(&consumer_lock);
+                // produce_board();
+                // mutex_unlock(&consumer_lock);
 
                 wake_up_interruptible(&rx_wait);
             }
@@ -478,27 +471,41 @@ static const struct file_operations kxo_fops = {
     .release = kxo_release,
 };
 
+void init_kxo_task(void)
+{
+    /* Setup structure for games*/
+    for (int i = 0; i < MAX_GAME; i++) {
+        struct kxo_task *new = &game_list[i];
+
+        new->id = i;
+        new->turn = 'O';
+        new->finish = 1;
+        memset(new->table, ' ', N_GRIDS);
+
+        tasklet_init(&new->tasklet, game_tasklet_func, (unsigned long) new);
+        INIT_WORK(&new->ai_one, ai_one_work_func);
+        INIT_WORK(&new->ai_two, ai_two_work_func);
+        INIT_WORK(&new->draw, drawboard_work_func);
+
+        mutex_init(&new->lock);
+    }
+}
+
 static int __init kxo_init(void)
 {
     dev_t dev_id;
     int ret;
 
+    init_kxo_task();
+
     if (kfifo_alloc(&rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
         return -ENOMEM;
 
     /* Register major/minor numbers */
-    ret = alloc_chrdev_region(&dev_id, 0, NR_KMLDRV, DEV_NAME);
+    ret = alloc_chrdev_region(&dev_id, 0, MAX_GAME, DEV_NAME);
     if (ret)
         goto error_alloc;
     major = MAJOR(dev_id);
-
-    /* Add the character device to the system */
-    cdev_init(&kxo_cdev, &kxo_fops);
-    ret = cdev_add(&kxo_cdev, dev_id, NR_KMLDRV);
-    if (ret) {
-        kobject_put(&kxo_cdev.kobj);
-        goto error_region;
-    }
 
     /* Create a class structure */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
@@ -511,16 +518,17 @@ static int __init kxo_init(void)
         ret = PTR_ERR(kxo_class);
         goto error_cdev;
     }
-    for (int i = 0; i < MAX_GAME; i++) {
-        /* Register the device with sysfs */
-        struct device *kxo_dev = device_create(kxo_class, NULL, MKDEV(major, i),
-                                               NULL, "%s%d", DEV_NAME, i);
 
-        ret = device_create_file(kxo_dev, &dev_attr_kxo_state);
-        if (ret < 0) {
-            printk(KERN_ERR "failed to create sysfs file kxo_state\n");
-            goto error_device;
+    /* Add the character device to the system */
+    for (int i = 0; i < MAX_GAME; i++) {
+        cdev_init(&game_list[i].cdev, &kxo_fops);
+        ret = cdev_add(&game_list[i].cdev, MKDEV(major, i), 1);
+        if (ret) {
+            kobject_put(&game_list[i].cdev.kobj);
+            goto error_region;
         }
+        game_list[i].dev =
+            device_create(kxo_class, NULL, MKDEV(major, i), NULL, "kxo%d", i);
     }
 
     /* Allocate fast circular buffer */
@@ -547,23 +555,10 @@ static int __init kxo_init(void)
     attr_obj.resume = '1';
     attr_obj.end = '0';
     rwlock_init(&attr_obj.lock);
+
     /* Setup the timer */
     timer_setup(&timer, timer_handler, 0);
     atomic_set(&open_cnt, 0);
-
-    /* Setup structure for games*/
-    for (int i = 0; i < MAX_GAME; i++) {
-        struct kxo_task *new = &game_list[i];
-
-        new->id = i;
-        new->turn = 'O';
-        new->finish = 1;
-        memset(new->table, ' ', N_GRIDS);
-
-        tasklet_init(&new->tasklet, game_tasklet_func, (unsigned long) new);
-        INIT_WORK(&new->ai_one, ai_one_work_func);
-        INIT_WORK(&new->ai_two, ai_two_work_func);
-    }
 
     pr_info("kxo: registered new kxo devices: %d, %d~%d\n", major, 0,
             MAX_GAME - 1);
@@ -573,12 +568,12 @@ error_workqueue:
     vfree(fast_buf.buf);
 error_vmalloc:
     device_destroy(kxo_class, dev_id);
-error_device:
-    class_destroy(kxo_class);
-error_cdev:
-    cdev_del(&kxo_cdev);
+// error_device:
+//     class_destroy(kxo_class);
 error_region:
     unregister_chrdev_region(dev_id, NR_KMLDRV);
+error_cdev:
+    cdev_del(&kxo_cdev);
 error_alloc:
     kfifo_free(&rx_fifo);
     goto out;
@@ -587,17 +582,18 @@ error_alloc:
 static void __exit kxo_exit(void)
 {
     dev_t dev_id = MKDEV(major, 0);
-
     del_timer_sync(&timer);
-    tasklet_kill(&game_tasklet);
+
     flush_workqueue(kxo_workqueue);
     destroy_workqueue(kxo_workqueue);
     vfree(fast_buf.buf);
-    device_destroy(kxo_class, dev_id);
+    for (int i = 0; i < MAX_GAME; i++) {
+        tasklet_kill(&game_list[i].tasklet);
+        device_destroy(kxo_class, MKDEV(major, i));
+        cdev_del(&game_list[i].cdev);
+    }
     class_destroy(kxo_class);
-    cdev_del(&kxo_cdev);
     unregister_chrdev_region(dev_id, NR_KMLDRV);
-
     kfifo_free(&rx_fifo);
     pr_info("kxo: unloaded\n");
 }
