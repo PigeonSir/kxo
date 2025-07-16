@@ -19,7 +19,7 @@ MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("In-kernel Tic-Tac-Toe game engine");
 
-#define MAX_GAME 10
+#define MAX_GAME 2
 /* Macro DECLARE_TASKLET_OLD exists for compatibility.
  * See https://lwn.net/Articles/830964/
  */
@@ -44,6 +44,7 @@ struct kxo_attr {
 
 /* Declare game infomation for coroutine */
 struct kxo_task {
+    bool playing;
     char turn;
     int finish;
     int id;
@@ -270,7 +271,7 @@ static void ai_two_work_func(struct work_struct *w)
     smp_mb();
 
     if (move != -1)
-        WRITE_ONCE(table[move], 'X');
+        WRITE_ONCE(cur->table[move], 'X');
 
     WRITE_ONCE(cur->turn, 'O');
     WRITE_ONCE(cur->finish, 1);
@@ -308,11 +309,11 @@ static void game_tasklet_func(unsigned long __data)
     READ_ONCE(cur->turn);
     smp_rmb();
 
-    if (finish && turn == 'O') {
+    if (cur->finish && cur->turn == 'O') {
         WRITE_ONCE(cur->finish, 0);
         smp_wmb();
         queue_work(kxo_workqueue, &cur->ai_one);
-    } else if (finish && turn == 'X') {
+    } else if (cur->finish && cur->turn == 'X') {
         WRITE_ONCE(cur->finish, 0);
         smp_wmb();
         queue_work(kxo_workqueue, &cur->ai_two);
@@ -353,6 +354,9 @@ static void timer_handler(struct timer_list *__timer)
     for (int i = 0; i < MAX_GAME; i++) {
         tv_start = ktime_get();
         struct kxo_task *cur = &game_list[i];
+
+        if (!cur->playing)
+            continue;
 
         char win = check_win(cur->table);
 
@@ -439,10 +443,12 @@ static atomic_t open_cnt;
 
 static int kxo_open(struct inode *inode, struct file *filp)
 {
+    int minor = MINOR(inode->i_rdev);
+    game_list[minor].playing = true;
     pr_debug("kxo: %s\n", __func__);
     if (atomic_inc_return(&open_cnt) == 1)
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
-    pr_info("openm current cnt: %d\n", atomic_read(&open_cnt));
+    pr_info("open current cnt: %d\n", atomic_read(&open_cnt));
 
     return 0;
 }
