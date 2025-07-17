@@ -44,20 +44,29 @@ struct kxo_attr {
 
 /* Declare game infomation for coroutine */
 struct kxo_task {
+    /* basic info of a game */
     bool playing;
     char turn;
     int finish;
     int id;
     char table[N_GRIDS];
+
+    /* for tasklet & workqueue */
     struct tasklet_struct tasklet;
     struct work_struct ai_one;
     struct work_struct ai_two;
     struct work_struct draw;
 
+    /* for cdev */
     struct cdev cdev;
     struct device *dev;
 
-    struct mutex lock;
+    /* the lock for modifing game info */
+    struct mutex lock, producer_lock, consumer_lock;
+
+    /* for drawing */
+    char draw_buffer[DRAWBUFFER_SIZE];
+    DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
 };
 
 /* Declare the queue of games */
@@ -98,12 +107,6 @@ static struct timer_list timer;
 /* Character device stuff */
 static int major;
 static struct class *kxo_class;
-static struct cdev kxo_cdev;
-
-static char draw_buffer[DRAWBUFFER_SIZE];
-
-/* Data are stored into a kfifo buffer before passing them to the userspace */
-static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
 
 /* NOTE: the usage of kfifo is safe (no need for extra locking), until there is
  * only one concurrent reader and one concurrent writer. Writes are serialized
@@ -115,52 +118,44 @@ static DEFINE_MUTEX(read_lock);
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 
 /* Insert the whole chess board into the kfifo buffer */
-static void produce_board(void)
+static void produce_board(struct kxo_task *cur)
 {
-    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, sizeof(draw_buffer));
-    if (unlikely(len < sizeof(draw_buffer)))
+    unsigned int len =
+        kfifo_in(&cur->rx_fifo, cur->draw_buffer, sizeof(cur->draw_buffer));
+    if (unlikely(len < sizeof(cur->draw_buffer)))
         pr_warn_ratelimited("%s: %zu bytes dropped\n", __func__,
-                            sizeof(draw_buffer) - len);
+                            sizeof(cur->draw_buffer) - len);
 
-    pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len, kfifo_len(&rx_fifo));
+    pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len,
+             kfifo_len(&cur->rx_fifo));
 }
-
-/* Mutex to serialize kfifo writers within the workqueue handler */
-static DEFINE_MUTEX(producer_lock);
-
-/* Mutex to serialize fast_buf consumers: we can use a mutex because consumers
- * run in workqueue handler (kernel thread context).
- */
-static DEFINE_MUTEX(consumer_lock);
 
 /* We use an additional "faster" circular buffer to quickly store data from
  * interrupt context, before adding them to the kfifo.
  */
 static struct circ_buf fast_buf;
 
-static char table[N_GRIDS];
-
 /* Draw the board into draw_buffer */
-static int draw_board(char *table)
+static int draw_board(struct kxo_task *cur)
 {
     int i = 0, k = 0;
-    draw_buffer[i++] = '\n';
+    cur->draw_buffer[i++] = '\n';
     smp_wmb();
-    draw_buffer[i++] = '\n';
+    cur->draw_buffer[i++] = '\n';
     smp_wmb();
 
     while (i < DRAWBUFFER_SIZE) {
         for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-            draw_buffer[i++] = j & 1 ? '|' : table[k++];
+            cur->draw_buffer[i++] = j & 1 ? '|' : cur->table[k++];
             smp_wmb();
         }
-        draw_buffer[i++] = '\n';
+        cur->draw_buffer[i++] = '\n';
         smp_wmb();
         for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
-            draw_buffer[i++] = '-';
+            cur->draw_buffer[i++] = '-';
             smp_wmb();
         }
-        draw_buffer[i++] = '\n';
+        cur->draw_buffer[i++] = '\n';
         smp_wmb();
     }
 
@@ -177,6 +172,7 @@ static void fast_buf_clear(void)
 /* Workqueue handler: executed by a kernel thread */
 static void drawboard_work_func(struct work_struct *w)
 {
+    struct kxo_task *cur = container_of(w, struct kxo_task, draw);
     int cpu;
 
     /* This code runs from a kernel thread, so softirqs and hard-irqs must
@@ -199,14 +195,14 @@ static void drawboard_work_func(struct work_struct *w)
     }
     read_unlock(&attr_obj.lock);
 
-    mutex_lock(&producer_lock);
-    draw_board(table);
-    mutex_unlock(&producer_lock);
+    mutex_lock(&cur->producer_lock);
+    draw_board(cur);
+    mutex_unlock(&cur->producer_lock);
 
     /* Store data to the kfifo buffer */
-    mutex_lock(&consumer_lock);
-    produce_board();
-    mutex_unlock(&consumer_lock);
+    mutex_lock(&cur->consumer_lock);
+    produce_board(cur);
+    mutex_unlock(&cur->consumer_lock);
 
     wake_up_interruptible(&rx_wait);
 }
@@ -261,7 +257,7 @@ static void ai_two_work_func(struct work_struct *w)
     WARN_ON_ONCE(in_interrupt());
 
     cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
+    pr_info("kxo: [CPU#%d game %d] start doing %s\n", cpu, cur->id, __func__);
     tv_start = ktime_get();
     mutex_lock(&cur->lock);
     int move;
@@ -280,8 +276,8 @@ static void ai_two_work_func(struct work_struct *w)
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] %s completed in %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
+    pr_info("kxo: [CPU#%d game %d] %s completed in %llu usec\n", cpu, cur->id,
+            __func__, (unsigned long long) nsecs >> 10);
     put_cpu();
 }
 
@@ -371,14 +367,14 @@ static void timer_handler(struct timer_list *__timer)
                         cur->id);
                 put_cpu();
 
-                // mutex_lock(&producer_lock);
-                // draw_board(cur->table);
-                // mutex_unlock(&producer_lock);
+                mutex_lock(&cur->producer_lock);
+                draw_board(cur);
+                mutex_unlock(&cur->producer_lock);
 
                 /* Store data to the kfifo buffer */
-                // mutex_lock(&consumer_lock);
-                // produce_board();
-                // mutex_unlock(&consumer_lock);
+                mutex_lock(&cur->consumer_lock);
+                produce_board(cur);
+                mutex_unlock(&cur->consumer_lock);
 
                 wake_up_interruptible(&rx_wait);
             }
@@ -396,10 +392,10 @@ static void timer_handler(struct timer_list *__timer)
         tv_end = ktime_get();
 
         nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-
-        pr_info("kxo: [CPU#%d] %s in_irq: %llu usec\n", smp_processor_id(),
-                __func__, (unsigned long long) nsecs >> 10);
     }
+
+    pr_info("kxo: [CPU#%d] %s in_irq: %llu usec\n", smp_processor_id(),
+            __func__, (unsigned long long) nsecs >> 10);
     mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
     local_irq_enable();
 }
@@ -409,6 +405,9 @@ static ssize_t kxo_read(struct file *file,
                         size_t count,
                         loff_t *ppos)
 {
+    int minor = MINOR(file_inode(file)->i_rdev);
+    struct kxo_task *cur = &game_list[minor];
+
     unsigned int read;
     int ret;
 
@@ -421,7 +420,7 @@ static ssize_t kxo_read(struct file *file,
         return -ERESTARTSYS;
 
     do {
-        ret = kfifo_to_user(&rx_fifo, buf, count, &read);
+        ret = kfifo_to_user(&cur->rx_fifo, buf, count, &read);
         if (unlikely(ret < 0))
             break;
         if (read)
@@ -430,9 +429,10 @@ static ssize_t kxo_read(struct file *file,
             ret = -EAGAIN;
             break;
         }
-        ret = wait_event_interruptible(rx_wait, kfifo_len(&rx_fifo));
+        ret = wait_event_interruptible(rx_wait, kfifo_len(&cur->rx_fifo));
     } while (ret == 0);
-    pr_debug("kxo: %s: out %u/%u bytes\n", __func__, read, kfifo_len(&rx_fifo));
+    pr_debug("kxo: %s: out %u/%u bytes\n", __func__, read,
+             kfifo_len(&cur->rx_fifo));
 
     mutex_unlock(&read_lock);
 
@@ -477,7 +477,7 @@ static const struct file_operations kxo_fops = {
     .release = kxo_release,
 };
 
-void init_kxo_task(void)
+int init_kxo_task(void)
 {
     /* Setup structure for games*/
     for (int i = 0; i < MAX_GAME; i++) {
@@ -494,7 +494,13 @@ void init_kxo_task(void)
         INIT_WORK(&new->draw, drawboard_work_func);
 
         mutex_init(&new->lock);
+        mutex_init(&new->producer_lock);
+        mutex_init(&new->consumer_lock);
+
+        if (kfifo_alloc(&new->rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
+            return -ENOMEM;
     }
+    return 0;
 }
 
 static int __init kxo_init(void)
@@ -502,10 +508,9 @@ static int __init kxo_init(void)
     dev_t dev_id;
     int ret;
 
-    init_kxo_task();
-
-    if (kfifo_alloc(&rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
-        return -ENOMEM;
+    ret = init_kxo_task();
+    if (ret)
+        return ret;
 
     /* Register major/minor numbers */
     ret = alloc_chrdev_region(&dev_id, 0, MAX_GAME, DEV_NAME);
@@ -553,9 +558,6 @@ static int __init kxo_init(void)
 
     negamax_init();
     mcts_init();
-    memset(table, ' ', N_GRIDS);
-    turn = 'O';
-    finish = 1;
 
     attr_obj.display = '1';
     attr_obj.resume = '1';
@@ -579,9 +581,11 @@ error_vmalloc:
 error_region:
     unregister_chrdev_region(dev_id, NR_KMLDRV);
 error_cdev:
-    cdev_del(&kxo_cdev);
+    for (int i = 0; i < MAX_GAME; i++)
+        cdev_del(&game_list[i].cdev);
 error_alloc:
-    kfifo_free(&rx_fifo);
+    for (int i = 0; i < MAX_GAME; i++)
+        kfifo_free(&game_list[i].rx_fifo);
     goto out;
 }
 
@@ -600,7 +604,8 @@ static void __exit kxo_exit(void)
     }
     class_destroy(kxo_class);
     unregister_chrdev_region(dev_id, NR_KMLDRV);
-    kfifo_free(&rx_fifo);
+    for (int i = 0; i < MAX_GAME; i++)
+        kfifo_free(&game_list[i].rx_fifo);
     pr_info("kxo: unloaded\n");
 }
 
