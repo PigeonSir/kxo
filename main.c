@@ -67,6 +67,8 @@ struct kxo_task {
     /* for drawing */
     char draw_buffer[DRAWBUFFER_SIZE];
     DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
+    wait_queue_head_t rx_wait;
+    struct mutex read_lock;
 };
 
 /* Declare the queue of games */
@@ -107,15 +109,6 @@ static struct timer_list timer;
 /* Character device stuff */
 static int major;
 static struct class *kxo_class;
-
-/* NOTE: the usage of kfifo is safe (no need for extra locking), until there is
- * only one concurrent reader and one concurrent writer. Writes are serialized
- * from the interrupt context, readers are serialized using this mutex.
- */
-static DEFINE_MUTEX(read_lock);
-
-/* Wait queue to implement blocking I/O from userspace */
-static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(struct kxo_task *cur)
@@ -204,7 +197,7 @@ static void drawboard_work_func(struct work_struct *w)
     produce_board(cur);
     mutex_unlock(&cur->consumer_lock);
 
-    wake_up_interruptible(&rx_wait);
+    wake_up_interruptible(&cur->rx_wait);
 }
 
 static char turn;
@@ -314,7 +307,7 @@ static void game_tasklet_func(unsigned long __data)
         smp_wmb();
         queue_work(kxo_workqueue, &cur->ai_two);
     }
-    // queue_work(kxo_workqueue, &cur->draw);
+    queue_work(kxo_workqueue, &cur->draw);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -330,7 +323,6 @@ static void ai_game(struct kxo_task *cur)
 
     pr_info("kxo: [CPU#%d] doing AI game\n", smp_processor_id());
     pr_info("kxo: [CPU#%d] scheduling tasklet\n", smp_processor_id());
-    // tasklet_schedule(&game_tasklet);
     tasklet_schedule(&cur->tasklet);
 }
 
@@ -376,7 +368,7 @@ static void timer_handler(struct timer_list *__timer)
                 produce_board(cur);
                 mutex_unlock(&cur->consumer_lock);
 
-                wake_up_interruptible(&rx_wait);
+                wake_up_interruptible(&cur->rx_wait);
             }
 
             if (attr_obj.end == '0') {
@@ -416,7 +408,7 @@ static ssize_t kxo_read(struct file *file,
     if (unlikely(!access_ok(buf, count)))
         return -EFAULT;
 
-    if (mutex_lock_interruptible(&read_lock))
+    if (mutex_lock_interruptible(&cur->read_lock))
         return -ERESTARTSYS;
 
     do {
@@ -429,12 +421,12 @@ static ssize_t kxo_read(struct file *file,
             ret = -EAGAIN;
             break;
         }
-        ret = wait_event_interruptible(rx_wait, kfifo_len(&cur->rx_fifo));
+        ret = wait_event_interruptible(cur->rx_wait, kfifo_len(&cur->rx_fifo));
     } while (ret == 0);
     pr_debug("kxo: %s: out %u/%u bytes\n", __func__, read,
              kfifo_len(&cur->rx_fifo));
 
-    mutex_unlock(&read_lock);
+    mutex_unlock(&cur->read_lock);
 
     return ret ? ret : read;
 }
@@ -496,6 +488,9 @@ int init_kxo_task(void)
         mutex_init(&new->lock);
         mutex_init(&new->producer_lock);
         mutex_init(&new->consumer_lock);
+        mutex_init(&new->read_lock);
+
+        init_waitqueue_head(&new->rx_wait);
 
         if (kfifo_alloc(&new->rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
             return -ENOMEM;
