@@ -10,7 +10,10 @@
         "tuple": "c",
         "type_traits": "c",
         "utility": "c",
-        "variant": "c"
+        "variant": "c",
+        "game.h": "c",
+        "mcts.h": "c",
+        "negamax.h": "c"
     },
     "editor.fontSize": 18,
     "workbench.colorTheme": "Default Dark Modern",

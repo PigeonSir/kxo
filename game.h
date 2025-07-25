@@ -1,5 +1,6 @@
 #pragma once
 
+#define MAX_GAME 2
 #define BOARD_SIZE 4
 #define GOAL 3
 #define ALLOW_EXCEED 1
