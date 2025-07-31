@@ -82,52 +82,51 @@ static void listen_keyboard_handler(void)
     close(attr_fd);
 }
 
-char draw_buffer[DRAWBUFFER_SIZE];
 char table[MAX_GAME][N_GRIDS];
 
-// /* Draw the board into draw_buffer */
-// static int draw_board(int id, int win)
-// {
-//     int i = 0, k = 0;
-//     draw_buffer[i++] = '\n';
-//     draw_buffer[i++] = '\n';
+/* Draw the board into draw_buffer */
+static int draw_board(int id, unsigned short data)
+{
+    printf("\n");
+    unsigned short win = (data >> 15) & 1;
+    char turn = (data >> 14) & 1 ? 'X' : 'O';
+    unsigned short game = (data >> 8) & 0x3F;
+    unsigned short move = data & 0xFF;
 
-//     while (i < DRAWBUFFER_SIZE) {
-//         for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-//             draw_buffer[i++] = j & 1 ? '|' : table[id][k++];
-//         }
-//         draw_buffer[i++] = '\n';
-//         for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
-//             draw_buffer[i++] = '-';
-//         }
-//         draw_buffer[i++] = '\n';
-//     }
+    printf("raw data : %x -> win=%d turn=%c game=%d move=%d\n", data, win, turn,
+           game, move);
+    if (win == 1) {
+        printf("\n");
+        printf(" game %d : %c win !!!", id, turn);
+        memset(table[id], ' ', N_GRIDS);
+        return 0;
+    }
 
-//     if (win != -1) {
-//         printf("\n");
-//         char winner = win == 1 ? 'X' : 'O';
-//         printf(" game %d : %c win !!!", id, winner);
-//     }
+    table[id][move] = turn;
 
-//     return 0;
-// }
+    int k = 0;
+    for (int row = 0; row < BOARD_SIZE; row++) {
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
+            if (j & 1)
+                printf("|");
+            else
+                printf("%c", table[id][k++]);
+        }
+        printf("\n");
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
+            printf("-");
+        }
+        printf("\n");
+    }
 
-// /* Insert the whole chess board into the kfifo buffer */
-// static void produce_board(int id, unsigned short data)
-// {
-//     unsigned short win = data >> 15 & 1;
-//     unsigned short turn_num = data >> 14 & 1;
-//     char turn = turn_num ? 'X' : 'O';
-//     if (win) {
-//         draw_board(id, turn_num);
-//         memset(table[id], ' ', N_GRIDS);
-//         return;
-//     }
-//     int move = data & 0xFF;
-//     table[id][move] = turn;
-//     draw_board(id, false);
-//     return;
-// }
+    if (win) {
+        printf("\n");
+        printf(" game %d : %c win !!!", id, turn);
+        memset(table[id], ' ', N_GRIDS);
+    }
+
+    return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -138,7 +137,7 @@ int main(int argc, char *argv[])
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    // unsigned short read_buf[DRAWBUFFER_SIZE];
+    memset(table[0], ' ', N_GRIDS);
 
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
@@ -164,23 +163,14 @@ int main(int argc, char *argv[])
             FD_CLR(device_fd, &readset);
             // printf("\033[H\033[J");
             /* ASCII escape code to clear the screen */
-            // u_int16_t buf[32];
-            // 最多一次讀 32 筆 move
-            u_int16_t buf = 0;
-            ssize_t n = read(device_fd, &buf, sizeof(buf));
+            unsigned char buf[2];
+            ssize_t n = read(device_fd, buf, 2);
             if (n < 0)
                 perror("read");
             if (n == 0)
                 continue;
-            // for (int i = 0; i < n / 2; i++) {
-            u_int16_t data = buf;
-            bool win = (data >> 15) & 1;
-            char turn = (data >> 14) & 1 ? 'X' : 'O';
-            u_int8_t game = (data >> 8) & 0x3F;
-            u_int8_t move = data & 0xFF;
-            printf("raw data : %x -> win=%d turn=%c game=%d move=%d\n", buf,
-                   win, turn, game, move);
-            // }
+            unsigned short data = buf[0] | ((unsigned short) buf[1] << 8);
+            draw_board(0, data);
         }
     }
 

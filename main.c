@@ -65,8 +65,8 @@ struct kxo_task {
 
     /* for drawing */
     char draw_buffer[DRAWBUFFER_SIZE];
-    DECLARE_KFIFO_PTR(rx_fifo, unsigned short);
-    // wait_queue_head_t rx_wait;
+    DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
+    wait_queue_head_t rx_wait;
     struct mutex read_lock;
 };
 
@@ -112,6 +112,8 @@ static struct class *kxo_class;
 static unsigned short produce_step(int win, char turn, int id, int move)
 {
     unsigned short tn = (turn == 'X') ? 1 : 0;
+    if (win)
+        tn ^= 1;
     unsigned short ret = ((win & 1) << 15) | ((tn & 1) << 14) |
                          ((id & 0x3F) << 8) | (move & 0xFF);
     return ret;
@@ -132,6 +134,7 @@ static void ai_work_func(struct work_struct *w)
     pr_info("kxo: [CPU#%d game#%d turn#%c] start doing %s\n", cpu, cur->id,
             cur->turn, __func__);
     tv_start = ktime_get();
+    mutex_lock(&cur->producer_lock);
     int move;
     unsigned short step = 0;
 
@@ -146,8 +149,12 @@ static void ai_work_func(struct work_struct *w)
     if (move != -1) {
         WRITE_ONCE(cur->table[move], cur->turn);
         WRITE_ONCE(step, produce_step(0, cur->turn, cur->id, move));
-        kfifo_in(&cur->rx_fifo, &step, sizeof(step));
+        unsigned char bytes[2];
+        bytes[0] = step & 0xFF;
+        bytes[1] = (step >> 8) & 0xFF;
+        kfifo_in(&cur->rx_fifo, bytes, 2);
         pr_info("write %4x to kfifo", step);
+        wake_up_interruptible(&cur->rx_wait);
     }
 
     if (cur->turn == 'O') {
@@ -157,6 +164,7 @@ static void ai_work_func(struct work_struct *w)
     }
     WRITE_ONCE(cur->finish, 1);
     smp_wmb();
+    mutex_unlock(&cur->producer_lock);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -240,10 +248,16 @@ static void timer_handler(struct timer_list *__timer)
         } else {
             read_lock(&attr_obj.lock);
             if (attr_obj.display == '1') {
+                mutex_lock(&cur->producer_lock);
                 unsigned short final;
                 WRITE_ONCE(final, produce_step(1, cur->turn, cur->id, 0));
-                kfifo_in(&cur->rx_fifo, &final, sizeof(final));
+                unsigned char bytes[2];
+                bytes[0] = final & 0xFF;
+                bytes[1] = (final >> 8) & 0xFF;
+                kfifo_in(&cur->rx_fifo, bytes, 2);
+                mutex_unlock(&cur->producer_lock);
                 pr_info("write %x to kfifo", final);
+                wake_up_interruptible(&cur->rx_wait);
             }
 
             if (attr_obj.end == '0') {
@@ -254,7 +268,6 @@ static void timer_handler(struct timer_list *__timer)
             read_unlock(&attr_obj.lock);
             pr_info("kxo: game %d -> %c win!!!\n", cur->id, win);
         }
-        // wake_up_interruptible(&cur->rx_wait);
     }
     tv_end = ktime_get();
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -283,30 +296,19 @@ static ssize_t kxo_read(struct file *file,
     if (mutex_lock_interruptible(&cur->read_lock))
         return -ERESTARTSYS;
 
-    // do {
-    if (kfifo_len(&cur->rx_fifo) == 0)
-        ret = 0;
-    else {
-        unsigned short mesg;
-        if (kfifo_out_peek(&cur->rx_fifo, &mesg, sizeof(mesg)) !=
-            sizeof(mesg)) {
-            pr_info("kxo: peek failed\n");
-            return -EFAULT;
-        }
-        pr_info("kfifo_to_user : %4x\n", mesg);
+    do {
         ret = kfifo_to_user(&cur->rx_fifo, buf, count, &read);
-    }
-    // if (unlikely(ret < 0))
-    //     break;
-    // if (read)
-    //     break;
-    // if (file->f_flags & O_NONBLOCK) {
-    //     ret = -EAGAIN;
-    //     break;
-    // }
-    //     ret = wait_event_interruptible(cur->rx_wait,
-    //         kfifo_len(&cur->rx_fifo));
-    // } while (ret == 0);
+        if (unlikely(ret < 0))
+            break;
+        if (read)
+            break;
+        if (file->f_flags & O_NONBLOCK) {
+            ret = -EAGAIN;
+            break;
+        }
+        ret = wait_event_interruptible(cur->rx_wait, kfifo_len(&cur->rx_fifo));
+    } while (ret == 0);
+
     pr_debug("kxo: %s: out %u/%u bytes\n", __func__, read,
              kfifo_len(&cur->rx_fifo));
 
@@ -347,7 +349,7 @@ static const struct file_operations kxo_fops = {
     .owner = THIS_MODULE,
 #endif
     .read = kxo_read,
-    .llseek = no_llseek,
+    .llseek = noop_llseek,
     .open = kxo_open,
     .release = kxo_release,
 };
@@ -371,7 +373,7 @@ static int init_kxo_task(void)
         mutex_init(&new->consumer_lock);
         mutex_init(&new->read_lock);
 
-        // init_waitqueue_head(&new->rx_wait);
+        init_waitqueue_head(&new->rx_wait);
 
         if (kfifo_alloc(&new->rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
             return -ENOMEM;
