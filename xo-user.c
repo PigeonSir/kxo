@@ -11,7 +11,7 @@
 #include "game.h"
 
 #define XO_STATUS_FILE "/sys/module/kxo/initstate"
-#define XO_DEVICE_FILE "/dev/kxo0"
+#define XO_DEVICE_FILE "/dev/kxo"
 #define XO_DEVICE_ATTR_FILE "/sys/class/kxo/kxo/kxo_state"
 
 static bool status_check(void)
@@ -83,6 +83,7 @@ static void listen_keyboard_handler(void)
 }
 
 char table[MAX_GAME][N_GRIDS];
+int fds[MAX_GAME];
 
 /* Draw the board into draw_buffer */
 static int draw_board(int id, unsigned short data)
@@ -135,20 +136,26 @@ int main(int argc, char *argv[])
 
     raw_mode_enable();
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    int max_fd = -1;
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    memset(table[0], ' ', N_GRIDS);
+    for (int i = 0; i < MAX_GAME; i++) {
+        memset(table[i], ' ', N_GRIDS);
+        char path[32];
+        snprintf(path, sizeof(path), "%s%d", XO_DEVICE_FILE, i);
+        fds[i] = open(path, O_RDONLY);
+        max_fd = fds[i] > STDIN_FILENO ? fds[i] : STDIN_FILENO;
+    }
 
     fd_set readset;
-    int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
-    int max_fd = device_fd > STDIN_FILENO ? device_fd : STDIN_FILENO;
     read_attr = true;
     end_attr = false;
 
     while (!end_attr) {
         FD_ZERO(&readset);
         FD_SET(STDIN_FILENO, &readset);
-        FD_SET(device_fd, &readset);
+        for (int i = 0; i < MAX_GAME; i++)
+            FD_SET(fds[i], &readset);
 
         int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
         if (result < 0) {
@@ -159,25 +166,30 @@ int main(int argc, char *argv[])
         if (FD_ISSET(STDIN_FILENO, &readset)) {
             FD_CLR(STDIN_FILENO, &readset);
             listen_keyboard_handler();
-        } else if (read_attr && FD_ISSET(device_fd, &readset)) {
-            FD_CLR(device_fd, &readset);
-            // printf("\033[H\033[J");
-            /* ASCII escape code to clear the screen */
-            unsigned char buf[2];
-            ssize_t n = read(device_fd, buf, 2);
-            if (n < 0)
-                perror("read");
-            if (n == 0)
-                continue;
-            unsigned short data = buf[0] | ((unsigned short) buf[1] << 8);
-            draw_board(0, data);
+        } else if (read_attr) {
+            for (int i = 0; i < MAX_GAME; i++) {
+                if (FD_ISSET(fds[i], &readset)) {
+                    FD_CLR(fds[i], &readset);
+                    // printf("\033[H\033[J");
+                    /* ASCII escape code to clear the screen */
+                    unsigned char buf[2];
+                    ssize_t n = read(fds[i], buf, 2);
+                    if (n < 0)
+                        perror("read");
+                    if (n == 0)
+                        continue;
+                    unsigned short data =
+                        buf[0] | ((unsigned short) buf[1] << 8);
+                    draw_board(i, data);
+                }
+            }
         }
     }
 
     raw_mode_disable();
     fcntl(STDIN_FILENO, F_SETFL, flags);
-
-    close(device_fd);
+    for (int i = 0; i < MAX_GAME; i++)
+        close(fds[i]);
 
     return 0;
 }
